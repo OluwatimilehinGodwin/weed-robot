@@ -1,0 +1,741 @@
+from datetime import (
+    datetime,
+    timezone,
+)
+from math import hypot
+
+import sqlite3
+import time
+
+from robot_config import (
+    ROUTE_DATA_DIR,
+    ROUTE_DB_PATH,
+)
+
+
+class RouteStore:
+    def __init__(self):
+        ROUTE_DATA_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self._initialize_database()
+
+    def _connect(self):
+        connection = sqlite3.connect(
+            ROUTE_DB_PATH,
+            timeout=10,
+        )
+
+        connection.row_factory = (
+            sqlite3.Row
+        )
+
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        return connection
+
+    def _ensure_column(
+        self,
+        db,
+        table,
+        column,
+        definition,
+    ):
+        columns = {
+            row["name"]
+            for row in db.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+
+        if column not in columns:
+            db.execute(
+                f"""
+                ALTER TABLE {table}
+                ADD COLUMN {column}
+                {definition}
+                """
+            )
+
+    def _initialize_database(self):
+        with self._connect() as db:
+            db.execute(
+                "PRAGMA journal_mode = WAL"
+            )
+
+            db.execute(
+                "PRAGMA synchronous = NORMAL"
+            )
+
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS routes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    name TEXT NOT NULL,
+
+                    created_at TEXT NOT NULL,
+
+                    status TEXT NOT NULL,
+
+                    field_width_cm REAL NOT NULL DEFAULT 0,
+                    field_height_cm REAL NOT NULL DEFAULT 0,
+
+                    row_count INTEGER NOT NULL DEFAULT 0,
+
+                    total_distance_cm REAL NOT NULL DEFAULT 0,
+
+                    point_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS route_points (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    route_id INTEGER NOT NULL,
+
+                    seq INTEGER NOT NULL,
+
+                    x_cm REAL NOT NULL,
+                    y_cm REAL NOT NULL,
+
+                    heading_deg REAL NOT NULL DEFAULT 0,
+
+                    velocity_cm_s REAL NOT NULL DEFAULT 0,
+
+                    mode TEXT NOT NULL DEFAULT 'AUTO',
+
+                    timestamp_ms INTEGER NOT NULL,
+
+                    distance_cm REAL NOT NULL DEFAULT 0,
+
+                    FOREIGN KEY(route_id)
+                        REFERENCES routes(id)
+                        ON DELETE CASCADE,
+
+                    UNIQUE(route_id, seq)
+                )
+                """
+            )
+
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS route_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    route_id INTEGER NOT NULL,
+
+                    seq INTEGER NOT NULL,
+
+                    event_type TEXT NOT NULL,
+
+                    timestamp_ms INTEGER NOT NULL,
+
+                    FOREIGN KEY(route_id)
+                        REFERENCES routes(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+
+            self._ensure_column(
+                db,
+                "route_points",
+                "distance_cm",
+                "REAL NOT NULL DEFAULT 0",
+            )
+
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_route_points_route_seq
+                ON route_points(route_id, seq)
+                """
+            )
+
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_route_events_route
+                ON route_events(route_id)
+                """
+            )
+
+            db.commit()
+
+    def create_route(
+        self,
+        name,
+        field_width_cm=0.0,
+        field_height_cm=0.0,
+        row_count=0,
+    ):
+        created_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO routes (
+                    name,
+                    created_at,
+                    status,
+                    field_width_cm,
+                    field_height_cm,
+                    row_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    created_at,
+                    "recording",
+                    field_width_cm,
+                    field_height_cm,
+                    row_count,
+                ),
+            )
+
+            route_id = (
+                cursor.lastrowid
+            )
+
+            db.commit()
+
+        self.add_event(
+            route_id,
+            "ROUTE_STARTED",
+            seq=0,
+        )
+
+        return self.get_route(
+            route_id
+        )
+
+    def append_point(
+        self,
+        route_id,
+        x_cm,
+        y_cm,
+        heading_deg=0.0,
+        velocity_cm_s=0.0,
+        mode="AUTO",
+        timestamp_ms=None,
+        distance_cm=0.0,
+    ):
+        result = self.append_points(
+            route_id,
+            [
+                {
+                    "x_cm": x_cm,
+                    "y_cm": y_cm,
+                    "heading_deg":
+                        heading_deg,
+
+                    "velocity_cm_s":
+                        velocity_cm_s,
+
+                    "mode": mode,
+
+                    "timestamp_ms":
+                        timestamp_ms,
+
+                    "distance_cm":
+                        distance_cm,
+                }
+            ],
+        )
+
+        return result[
+            "first_seq"
+        ]
+
+    def append_points(
+        self,
+        route_id,
+        points,
+    ):
+        if not points:
+            return {
+                "first_seq": None,
+                "last_seq": None,
+                "count": 0,
+            }
+
+        now_ms = int(
+            time.time() * 1000
+        )
+
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT
+                    COALESCE(
+                        MAX(seq),
+                        -1
+                    ) + 1
+                    AS next_seq
+
+                FROM route_points
+
+                WHERE route_id = ?
+                """,
+                (
+                    route_id,
+                ),
+            ).fetchone()
+
+            first_seq = int(
+                row["next_seq"]
+            )
+
+            values = []
+
+            for offset, point in enumerate(
+                points
+            ):
+                timestamp_ms = (
+                    point.get(
+                        "timestamp_ms"
+                    )
+                )
+
+                if timestamp_ms is None:
+                    timestamp_ms = (
+                        now_ms
+                    )
+
+                values.append(
+                    (
+                        route_id,
+
+                        first_seq
+                        + offset,
+
+                        float(
+                            point[
+                                "x_cm"
+                            ]
+                        ),
+
+                        float(
+                            point[
+                                "y_cm"
+                            ]
+                        ),
+
+                        float(
+                            point.get(
+                                "heading_deg",
+                                0.0,
+                            )
+                        ),
+
+                        float(
+                            point.get(
+                                "velocity_cm_s",
+                                0.0,
+                            )
+                        ),
+
+                        str(
+                            point.get(
+                                "mode",
+                                "AUTO",
+                            )
+                        ),
+
+                        int(
+                            timestamp_ms
+                        ),
+
+                        float(
+                            point.get(
+                                "distance_cm",
+                                0.0,
+                            )
+                        ),
+                    )
+                )
+
+            db.executemany(
+                """
+                INSERT INTO route_points (
+                    route_id,
+                    seq,
+                    x_cm,
+                    y_cm,
+                    heading_deg,
+                    velocity_cm_s,
+                    mode,
+                    timestamp_ms,
+                    distance_cm
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
+                """,
+                values,
+            )
+
+            db.commit()
+
+        return {
+            "first_seq":
+                first_seq,
+
+            "last_seq":
+                first_seq
+                + len(values)
+                - 1,
+
+            "count":
+                len(values),
+        }
+
+    def add_event(
+        self,
+        route_id,
+        event_type,
+        seq=None,
+        timestamp_ms=None,
+    ):
+        if timestamp_ms is None:
+            timestamp_ms = int(
+                time.time() * 1000
+            )
+
+        with self._connect() as db:
+            if seq is None:
+                row = db.execute(
+                    """
+                    SELECT
+                        COALESCE(
+                            MAX(seq),
+                            0
+                        )
+                        AS current_seq
+
+                    FROM route_points
+
+                    WHERE route_id = ?
+                    """,
+                    (
+                        route_id,
+                    ),
+                ).fetchone()
+
+                seq = int(
+                    row[
+                        "current_seq"
+                    ]
+                )
+
+            db.execute(
+                """
+                INSERT INTO route_events (
+                    route_id,
+                    seq,
+                    event_type,
+                    timestamp_ms
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    route_id,
+                    seq,
+                    event_type,
+                    timestamp_ms,
+                ),
+            )
+
+            db.commit()
+
+    def finish_route(
+        self,
+        route_id,
+    ):
+        route = self.get_route(
+            route_id
+        )
+
+        if route is None:
+            return None
+
+        points = route[
+            "points"
+        ]
+
+        point_count = len(
+            points
+        )
+
+        if points:
+            x_values = [
+                point["x_cm"]
+                for point in points
+            ]
+
+            y_values = [
+                point["y_cm"]
+                for point in points
+            ]
+
+            forward_span_cm = (
+                max(x_values)
+                - min(x_values)
+            )
+
+            lateral_span_cm = (
+                max(y_values)
+                - min(y_values)
+            )
+
+            reported_distance_cm = max(
+                point.get(
+                    "distance_cm",
+                    0.0,
+                )
+                for point in points
+            )
+
+            if (
+                reported_distance_cm
+                > 0
+            ):
+                total_distance_cm = (
+                    reported_distance_cm
+                )
+
+            else:
+                total_distance_cm = (
+                    0.0
+                )
+
+                for first, second in zip(
+                    points,
+                    points[1:],
+                ):
+                    total_distance_cm += hypot(
+                        (
+                            second["x_cm"]
+                            - first["x_cm"]
+                        ),
+                        (
+                            second["y_cm"]
+                            - first["y_cm"]
+                        ),
+                    )
+
+            row_count = (
+                1
+                + sum(
+                    1
+                    for event
+                    in route["events"]
+
+                    if event[
+                        "event_type"
+                    ]
+                    == "NEXT_ROW_STARTED"
+                )
+            )
+
+        else:
+            forward_span_cm = 0.0
+            lateral_span_cm = 0.0
+            total_distance_cm = 0.0
+            row_count = 0
+
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE routes
+
+                SET
+                    status = ?,
+                    field_width_cm = ?,
+                    field_height_cm = ?,
+                    row_count = ?,
+                    total_distance_cm = ?,
+                    point_count = ?
+
+                WHERE id = ?
+                """,
+                (
+                    "completed",
+
+                    lateral_span_cm,
+                    forward_span_cm,
+
+                    row_count,
+
+                    total_distance_cm,
+                    point_count,
+
+                    route_id,
+                ),
+            )
+
+            db.commit()
+
+        self.add_event(
+            route_id,
+            "ROUTE_FINISHED",
+        )
+
+        return self.get_route(
+            route_id
+        )
+
+    def route_exists(
+        self,
+        route_id,
+    ):
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT 1
+
+                FROM routes
+
+                WHERE id = ?
+
+                LIMIT 1
+                """,
+                (
+                    route_id,
+                ),
+            ).fetchone()
+
+        return row is not None
+
+        
+    def list_routes(self):
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+
+                FROM routes
+
+                ORDER BY id DESC
+                """
+            ).fetchall()
+
+        return [
+            dict(row)
+            for row in rows
+        ]
+
+    def get_route(
+        self,
+        route_id,
+    ):
+        with self._connect() as db:
+            route = db.execute(
+                """
+                SELECT *
+
+                FROM routes
+
+                WHERE id = ?
+                """,
+                (
+                    route_id,
+                ),
+            ).fetchone()
+
+            if route is None:
+                return None
+
+            points = db.execute(
+                """
+                SELECT
+                    seq,
+                    x_cm,
+                    y_cm,
+                    heading_deg,
+                    velocity_cm_s,
+                    mode,
+                    timestamp_ms,
+                    distance_cm
+
+                FROM route_points
+
+                WHERE route_id = ?
+
+                ORDER BY seq
+                """,
+                (
+                    route_id,
+                ),
+            ).fetchall()
+
+            events = db.execute(
+                """
+                SELECT
+                    seq,
+                    event_type,
+                    timestamp_ms
+
+                FROM route_events
+
+                WHERE route_id = ?
+
+                ORDER BY id
+                """,
+                (
+                    route_id,
+                ),
+            ).fetchall()
+
+        result = dict(
+            route
+        )
+
+        result["points"] = [
+            dict(point)
+            for point in points
+        ]
+
+        result["events"] = [
+            dict(event)
+            for event in events
+        ]
+
+        return result
+
+    def delete_route(
+        self,
+        route_id,
+    ):
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                DELETE FROM routes
+
+                WHERE id = ?
+                """,
+                (
+                    route_id,
+                ),
+            )
+
+            deleted = (
+                cursor.rowcount
+                > 0
+            )
+
+            db.commit()
+
+        return deleted

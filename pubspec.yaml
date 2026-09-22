@@ -1,0 +1,24 @@
+name: weedrobot
+description: Timirex agricultural robot operator interface.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  flutter_mjpeg: ^2.0.4
+  web_socket_channel: ^3.0.3
+  http: ^0.13.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
